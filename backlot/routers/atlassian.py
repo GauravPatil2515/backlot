@@ -470,6 +470,7 @@ _JIRA_SEARCH_BODY_KEYS = frozenset(
         "expand",
         "properties",
         "reconcileIssues",
+        "failFast",
     }
 )
 # search/jql's own maxResults range on both methods; see errors_atlassian.max_results_out_of_range
@@ -533,7 +534,21 @@ def _jira_search_max_results(value) -> int:
     return int(n)
 
 
+# What Java's `String.trim()` removes: every character up to and including the space.
+_JAVA_TRIMMED = "".join(map(chr, range(0x21)))
+
 _JIRA_BOOLEAN_TEXTS = frozenset({"", "null", "true", "True", "TRUE", "false", "False", "FALSE"})
+_SPRING_BOOLEANS = frozenset({"true", "false", "yes", "no", "on", "off", "1", "0"})
+
+
+def _jira_spring_bool_ok(raw: str) -> bool:
+    """Whether a query parameter converts to a Spring boolean on Jira Cloud,
+    measured 2026-10-12 on `fieldsByKeys` and `failFast`. Empty string is accepted as default.
+    Otherwise trimmed of Java control/whitespace characters and case-folded against
+    standard Spring boolean tokens."""
+    if raw == "":
+        return True
+    return raw.strip(_JAVA_TRIMMED).casefold() in _SPRING_BOOLEANS
 
 
 def _jira_fields_by_keys_ok(value) -> bool:
@@ -633,6 +648,8 @@ async def jira_search(request: Request):
             raise errors_atlassian.body_not_read(errors_atlassian.BODY_NOT_AN_OBJECT)
         if not _jira_fields_by_keys_ok(body.get("fieldsByKeys")):
             raise errors_atlassian.body_not_read(errors_atlassian.BODY_NOT_AN_OBJECT)
+        if not _jira_fields_by_keys_ok(body.get("failFast")):
+            raise errors_atlassian.body_not_read(errors_atlassian.BODY_NOT_AN_OBJECT)
         raw_properties = body.get("properties")
         if raw_properties is not None and (
             not isinstance(raw_properties, list)
@@ -657,17 +674,32 @@ async def jira_search(request: Request):
             raise errors_atlassian.properties_null_element(raw_properties.index(None))
         token = raw_token
         reconcile_null = "reconcileIssues" in body and raw_reconcile is None
+        reconcile_count = len(raw_reconcile) if isinstance(raw_reconcile, list) else 0
     else:
+        for name in ("fieldsByKeys", "failFast"):
+            values = request.query_params.getlist(name)
+            if values and not _jira_spring_bool_ok(values[0]):
+                raise errors_atlassian.integer_conversion_failure(
+                    _echoed_path(request), name, values
+                )
+        reconcile_values = request.query_params.getlist("reconcileIssues")
+        if reconcile_values and any(not _jira_reconcile_issue_ok(v) for v in reconcile_values):
+            raise errors_atlassian.integer_conversion_failure(
+                _echoed_path(request), "reconcileIssues", reconcile_values
+            )
         jql = _str_param(request, "jql") or ""
         max_results_sent = _jira_max_results_was_sent(request)
         limit = _int_param(request, "maxResults", default_size)
         token = _str_param(request, "nextPageToken")
         reconcile_null = False
+        reconcile_count = len(request.query_params.getlist("reconcileIssues"))
     # An undecodable token is refused before the project clause is resolved (measured
     # 2026-09-16; see test_jira_search_refuses_a_page_token_it_cannot_decode).
     offset = decode_cursor_or_none(None if token is None else str(token))
     if offset is None:
         raise errors_atlassian.bad_page_token()
+    if reconcile_count > 50:
+        raise errors_atlassian.reconcile_issues_too_many()
     if max_results_sent and not (
         _JIRA_SEARCH_MAX_RESULTS_RANGE[0] <= limit <= _JIRA_SEARCH_MAX_RESULTS_RANGE[1]
     ):
@@ -2323,10 +2355,6 @@ def _confluence_page_params(
     if cap is not None:
         limit = min(limit, cap)
     return limit, start
-
-
-# What Java's `String.trim()` removes: every character up to and including the space.
-_JAVA_TRIMMED = "".join(map(chr, range(0x21)))
 
 
 def _cql_page_param(request: Request, name: str, default: int) -> int | None:

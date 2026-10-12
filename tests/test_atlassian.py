@@ -2843,6 +2843,12 @@ _RECONCILE_NULL = {
 }
 
 
+_RECONCILE_TOO_MANY = {
+    "errorMessages": ["The max number of issues to reconcile is 50."],
+    "errors": {},
+}
+
+
 def _properties_null(index: int) -> dict:
     return {"message": f"at index {index}", "status-code": 500, "stack-trace": ""}
 
@@ -2870,6 +2876,8 @@ _BEAN_MEMBER_ROWS = [
             *("1.5", "1.0", "[]", "{}"),
         )
     ],
+    *[(_bean(f'"failFast": {v}'), None) for v in ("true", "false", '"true"', "1", "null")],
+    *[(_bean(f'"failFast": {v}'), _BEAN_REFUSED) for v in ('"x"', '"yes"', "[]", "{}")],
     *[
         (_bean(f'"properties": {v}'), None)
         for v in ("[1]", "[1.5]", "[true]", '[""]', "[]", "null")
@@ -2938,6 +2946,26 @@ _BEAN_MEMBER_ROWS = [
             _bean('"reconcileIssues": null, "properties": [null]'),
         )
     ],
+    (
+        _bean(f'"reconcileIssues": {[10000 + i for i in range(50)]}'),
+        None,
+    ),
+    (
+        _bean(f'"reconcileIssues": {[10000 + i for i in range(51)]}'),
+        _RECONCILE_TOO_MANY,
+    ),
+    (
+        _bean(f'"reconcileIssues": {[10000 + i for i in range(51)]}', jql=None),
+        _RECONCILE_TOO_MANY,
+    ),
+    (
+        _bean(f'"reconcileIssues": {[10000 + i for i in range(51)]}, "maxResults": 0'),
+        _RECONCILE_TOO_MANY,
+    ),
+    (
+        _bean(f'"reconcileIssues": {[10000 + i for i in range(51)]}, "nextPageToken": "bogus"'),
+        errors_atlassian.bad_page_token().body,
+    ),
 ]
 
 
@@ -2955,6 +2983,126 @@ def test_jira_search_post_binds_the_members_it_does_not_act_on_as_real_binds_the
     else:
         assert (r.status_code, r.json()) == (want.get("status-code", 400), want), r.text
         assert r.headers["content-type"] == "application/json;charset=UTF-8"
+
+
+@pytest.mark.parametrize(
+    "query,want_status,want_detail",
+    [
+        ("failFast=true", 200, None),
+        ("failFast=yes", 200, None),
+        ("failFast=", 200, None),
+        ("failFast=%01true", 200, None),
+        ("failFast=ye\u017f", 200, None),
+        ("failFast=yes&failFast=x", 200, None),
+        ("failFast=x", 400, "Failed to convert 'failFast' with value: 'x'"),
+        ("failFast=null", 400, "Failed to convert 'failFast' with value: 'null'"),
+        ("failFast=%20", 400, "Failed to convert 'failFast' with value: ' '"),
+        (
+            "failFast=x&failFast=yes",
+            400,
+            "Failed to convert 'failFast' with value: '[Ljava.lang.String;",
+        ),
+    ],
+)
+def test_jira_search_get_fail_fast_validation(client, admin_h, query, want_status, want_detail):
+    for endpoint in ("/atlassian/rest/api/3/search/jql", "/atlassian/rest/api/2/search/jql"):
+        r = client.get(f"{endpoint}?jql=project+is+not+EMPTY&{query}", headers=admin_h)
+        assert r.status_code == want_status, f"{endpoint} {query}: {r.text}"
+        if want_detail is not None:
+            assert want_detail in r.json()["detail"]
+            assert r.headers["content-type"] == "application/problem+json;charset=UTF-8"
+
+
+def test_jira_search_reconcile_issues_cap(client, admin_h):
+    q50 = "&".join(f"reconcileIssues={10000 + i}" for i in range(50))
+    for ep in ("/atlassian/rest/api/3/search/jql", "/atlassian/rest/api/2/search/jql"):
+        r = client.get(f"{ep}?jql=project+is+not+EMPTY&{q50}", headers=admin_h)
+        assert r.status_code == 200, r.text
+
+    q51 = "&".join(f"reconcileIssues={10000 + i}" for i in range(51))
+    for ep in ("/atlassian/rest/api/3/search/jql", "/atlassian/rest/api/2/search/jql"):
+        r = client.get(f"{ep}?jql=project+is+not+EMPTY&{q51}", headers=admin_h)
+        assert r.status_code == 400, r.text
+        assert r.json() == _RECONCILE_TOO_MANY
+        assert r.headers["content-type"] == "application/json;charset=UTF-8"
+
+    # 51 copies of one id
+    q51_same = "&".join("reconcileIssues=10000" for _ in range(51))
+    r = client.get(
+        f"/atlassian/rest/api/3/search/jql?jql=project+is+not+EMPTY&{q51_same}", headers=admin_h
+    )
+    assert r.status_code == 400
+    assert r.json() == _RECONCILE_TOO_MANY
+
+    # 50 ids and an empty value
+    q50_empty = q50 + "&reconcileIssues="
+    r = client.get(
+        f"/atlassian/rest/api/3/search/jql?jql=project+is+not+EMPTY&{q50_empty}", headers=admin_h
+    )
+    assert r.status_code == 400
+    assert r.json() == _RECONCILE_TOO_MANY
+
+    # Precedence: bad page token outranks cap
+    r = client.get(
+        f"/atlassian/rest/api/3/search/jql?jql=project+is+not+EMPTY&nextPageToken=bogus&{q51}",
+        headers=admin_h,
+    )
+    assert r.status_code == 400
+    assert r.json() == errors_atlassian.bad_page_token().body
+
+    # Precedence: cap outranks maxResults=0
+    r = client.get(
+        f"/atlassian/rest/api/3/search/jql?jql=project+is+not+EMPTY&maxResults=0&{q51}",
+        headers=admin_h,
+    )
+    assert r.status_code == 400
+    assert r.json() == _RECONCILE_TOO_MANY
+
+    # Precedence: cap outranks unbounded JQL (no jql)
+    r = client.get(f"/atlassian/rest/api/3/search/jql?{q51}", headers=admin_h)
+    assert r.status_code == 400
+    assert r.json() == _RECONCILE_TOO_MANY
+
+    # Precedence: conversions outrank cap
+    # 51 ids beside fieldsByKeys=x
+    r = client.get(
+        f"/atlassian/rest/api/3/search/jql?jql=project+is+not+EMPTY&fieldsByKeys=x&{q51}",
+        headers=admin_h,
+    )
+    assert r.status_code == 400
+    assert "Failed to convert 'fieldsByKeys'" in r.json()["detail"]
+
+    # 51 ids beside failFast=x
+    r = client.get(
+        f"/atlassian/rest/api/3/search/jql?jql=project+is+not+EMPTY&failFast=x&{q51}",
+        headers=admin_h,
+    )
+    assert r.status_code == 400
+    assert "Failed to convert 'failFast'" in r.json()["detail"]
+
+    # 51 ids with an 'a' among them
+    q51_with_a = q50 + "&reconcileIssues=a"
+    r = client.get(
+        f"/atlassian/rest/api/3/search/jql?jql=project+is+not+EMPTY&{q51_with_a}",
+        headers=admin_h,
+    )
+    assert r.status_code == 400
+    assert "Failed to convert 'reconcileIssues'" in r.json()["detail"]
+
+    # Order among conversions: fieldsByKeys precedes failFast precedes reconcileIssues
+    r = client.get(
+        "/atlassian/rest/api/3/search/jql?jql=project+is+not+EMPTY&reconcileIssues=a&failFast=x&fieldsByKeys=x",
+        headers=admin_h,
+    )
+    assert r.status_code == 400
+    assert "Failed to convert 'fieldsByKeys'" in r.json()["detail"]
+
+    r = client.get(
+        "/atlassian/rest/api/3/search/jql?jql=project+is+not+EMPTY&reconcileIssues=a&failFast=x",
+        headers=admin_h,
+    )
+    assert r.status_code == 400
+    assert "Failed to convert 'failFast'" in r.json()["detail"]
 
 
 def test_jira_search_post_refuses_a_jql_shaped_as_a_list(client, admin_h):
